@@ -360,6 +360,7 @@ def moe_gemm_a4w4(
     limit=1.0,
     unpadded_N=None,
     unpadded_K=None,
+    config=None,
     backend: Optional[Literal["triton", "gluon"]] = None,
 ):
     """
@@ -397,7 +398,7 @@ def moe_gemm_a4w4(
     if unpadded_K and block_m == 16:
         K = unpadded_K
     # compute optimization flags
-    config = get_kernel_config(M, N, K, routing_data)
+    config = config if config is not None else get_kernel_config(M, N, K, routing_data)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -656,3 +657,73 @@ def moe_gemm_torch(
         out[i, :] = y[src_idx[i], :].float().sum(0)
 
     return out
+
+
+if __name__ == "__main__":
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    from op_tests.triton_tests.moe.test_moe_gemm_a4w4 import (
+        init_routing_data,
+        init_compute_data,
+        dtype_str_to_torch,
+    )
+    from aiter.ops.triton.moe.quant_moe import (
+        downcast_to_mxfp,
+    )
+    from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+        mxfp4_quant,
+        moe_gemm_a4w4,
+    )
+
+    # test the kernel
+    device = torch.device("cuda")
+    m = 2048
+    n = 1024
+    k = 7168
+    n_expts_tot = 1
+    n_expts_act = 1
+    do_gather = False
+    do_scatter = False
+    has_y_gammas = False
+    fused_quant = False
+    swizzle_mx_scale = None
+    apply_swiglu = False
+
+    act_mxfp4 = "mxfloat4_e2m1"
+    weight_mxfp4 = "mxfloat4_e2m1"
+    weight_dtype_str = weight_mxfp4[2:]
+    weight_dtype = dtype_str_to_torch(weight_dtype_str)
+
+    # initialize routing data
+    m, routing_data, gather_idx, scatter_idx = init_routing_data(m, n_expts_tot, n_expts_act, do_gather, do_scatter, device=device)
+
+    # initialize compute data
+    x, w, bias, gamma = init_compute_data(m, n, k, gather_idx, scatter_idx, n_expts_tot, n_expts_act, torch.bfloat16, torch.bfloat16, has_y_gammas, device=device)
+    x, x_scales = mxfp4_quant(x)
+    w, w_scales = downcast_to_mxfp(w, torch.uint8, axis=1)
+    out_dtype = torch.bfloat16
+
+    # run gluon kernel
+    bias = None
+    x_static_scale = None
+    if not act_mxfp4 and fused_quant:
+        quant_static_scale = x.abs().max().float() / 448.0
+    else:
+        quant_static_scale = None
+    y_gluon = moe_gemm_a4w4(
+        x,
+        w,
+        x_scales,
+        w_scales,
+        x_static_scale,
+        quant_static_scale,
+        bias,
+        routing_data,
+        gather_idx,
+        scatter_idx,
+        gamma,
+        swizzle_mx_scale,
+        out_dtype,
+        apply_swiglu,
+        backend="gluon",
+    )
