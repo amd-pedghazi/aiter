@@ -385,36 +385,44 @@ def _get_compiled_stage2(
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
             stream = torch.cuda.current_stream()
             # fp4/e8m0 dtypes are not supported by dlpack; cast to uint8
+            # Flatten all tensors to 1D to avoid multi-dimensional memref
+            # address calculations that increase VGPR pressure in the JIT kernel.
             _a = (
-                a.view(torch.uint8)
+                a.view(torch.uint8).reshape(-1)
                 if a.dtype
                 not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else a
+                else a.reshape(-1)
             )
             _w = (
-                w.view(torch.uint8)
+                w.view(torch.uint8).reshape(-1)
                 if w.dtype
                 not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else w
+                else w.reshape(-1)
             )
-            _as = (
-                a_scale.view(torch.uint8)
-                if a_scale is not None
+            if (
+                a_scale is not None
                 and a_scale.numel() > 0
                 and a_scale.dtype
                 not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else a_scale
-            )
-            _ws = (
-                w_scale.view(torch.uint8)
-                if w_scale is not None
+            ):
+                _as = a_scale.view(torch.uint8).reshape(-1)
+            elif a_scale is not None and a_scale.numel() > 0:
+                _as = a_scale.reshape(-1)
+            else:
+                _as = a_scale
+            if (
+                w_scale is not None
                 and w_scale.numel() > 0
                 and w_scale.dtype
                 not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else w_scale
-            )
+            ):
+                _ws = w_scale.view(torch.uint8).reshape(-1)
+            elif w_scale is not None and w_scale.numel() > 0:
+                _ws = w_scale.reshape(-1)
+            else:
+                _ws = w_scale
             exe(
-                target,
+                target.reshape(-1),
                 _a,
                 _w,
                 _as,
@@ -432,11 +440,11 @@ def _get_compiled_stage2(
             )
         else:
             exe(
-                target,
-                a,
-                w,
-                a_scale,
-                w_scale,
+                target.reshape(-1),
+                a.reshape(-1),
+                w.reshape(-1),
+                a_scale.reshape(-1) if a_scale is not None and a_scale.numel() > 0 else a_scale,
+                w_scale.reshape(-1) if w_scale is not None and w_scale.numel() > 0 else w_scale,
                 sorted_ids,
                 sorted_expert_ids,
                 topk_weights,
