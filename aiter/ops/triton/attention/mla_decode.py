@@ -678,7 +678,9 @@ def csr_to_dense_block_table(kv_indices, kv_indptr, dense_table, max_ctx, bs):
     BLOCK_N = 128
     grid = (bs, triton.cdiv(max_ctx, BLOCK_N))
     _csr_to_dense_kernel[grid](
-        kv_indices, kv_indptr, dense_table,
+        kv_indices,
+        kv_indptr,
+        dense_table,
         dense_table.stride(0),
         BLOCK_N=BLOCK_N,
     )
@@ -718,16 +720,42 @@ def decode_attention_fwd(
     if not use_grouped:
         # MHA, or MLA on ROCm (per-head path)
         _decode_att_m_fwd(
-            q, k_buffer, v_buffer, attn_logits, req_to_token, b_seq_len,
-            num_kv_splits, sm_scale, page_size, logit_cap, k_scale, v_scale,
+            q,
+            k_buffer,
+            v_buffer,
+            attn_logits,
+            req_to_token,
+            b_seq_len,
+            num_kv_splits,
+            sm_scale,
+            page_size,
+            logit_cap,
+            k_scale,
+            v_scale,
         )
     else:
         # GQA/MQA/MLA (grouped-head path)
         _decode_grouped_att_m_fwd(
-            q, k_buffer, v_buffer, attn_logits, req_to_token, b_seq_len,
-            num_kv_splits, sm_scale, page_size, logit_cap, k_scale, v_scale,
+            q,
+            k_buffer,
+            v_buffer,
+            attn_logits,
+            req_to_token,
+            b_seq_len,
+            num_kv_splits,
+            sm_scale,
+            page_size,
+            logit_cap,
+            k_scale,
+            v_scale,
         )
 
     _decode_softmax_reducev_fwd(
-        attn_logits, q, o, lse, v_buffer, b_seq_len, num_kv_splits,
+        attn_logits,
+        q,
+        o,
+        lse,
+        v_buffer,
+        b_seq_len,
+        num_kv_splits,
     )
