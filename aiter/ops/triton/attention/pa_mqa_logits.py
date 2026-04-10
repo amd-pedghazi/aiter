@@ -1,80 +1,38 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# ========================================================================
-# How to use AOT gluon kernel for pa_mqa_logits on lower triton version (below 3.4.0):
-#   1. Generate Gluon kernel based on rocm/triton/gluon_ext (3.5.0+gite392a058)
-#      it requires zip installed.
-#          $ cd ${AOT_DUMP_AITER_ROOT}
-#          $ python3 op_tests/op_benchmarks/triton/bench_deepgemm_attention.py --batch=1 -aot [-p]
-#      "-p" means kernel could assume the stride of KVCache is aligned to 16B.
-#      If enable it, the stride of KVCache in the AOT_load side must also be aligned to 16B.
-#   2. Copy generated paged_mqa_logits_aot_kernel.zip to ${AOT_LOAD_AITER_ROOT}/aiter/ops/triton/configs
-#      and unzip it.
-#          $ cd ${AOT_LOAD_AITER_ROOT}
-#          $ cd aiter/ops/triton/configs && unzip paged_mqa_logits_aot_kernel.zip && cd -
-#   3. Set env variable to enable AOT gluon kernel loading
-#          $ export AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1
-#          $ python3 op_tests/op_benchmarks/triton/bench_deepgemm_attention.py -kv_length=32768 --batch=2 -mtp=1 -p
-#      Set AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=0 to disable AOT gluon kernel. It will backward
-#      to triton JIT kernel
-# ========================================================================
-
 import os
 import math
 from functools import lru_cache
 
 import torch
 import triton
-from packaging.version import Version
 from triton.backends.compiler import GPUTarget
+from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
 
 from aiter import dtypes
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
-
 from aiter.jit.utils.chip_info import get_gfx
-
-enable_aot_gluon_pa_mqa_logits = os.environ.get(
-    "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS", "0"
+from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
+    _deepgemm_fp8_paged_mqa_logits,
+    _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
+    _deepgemm_fp8_paged_mqa_logits_ragged_k,
+    _deepgemm_fp8_paged_mqa_logits_stage1,
+    _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
 )
-enable_aot_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits == "1"
-triton_version = Version(Version(triton.__version__).base_version)
-if triton_version >= Version("3.5.0"):
-    from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
+from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+from aiter.ops.triton.gluon.pa_mqa_logits import (
+    _gluon_deepgemm_fp8_paged_mqa_logits,
+    _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
+    _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
+)
 
-    from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
-        _deepgemm_fp8_paged_mqa_logits,
-        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
-        _deepgemm_fp8_paged_mqa_logits_ragged_k,
-        _deepgemm_fp8_paged_mqa_logits_stage1,
-        _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
-    )
-    from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
-    from aiter.ops.triton.gluon.pa_mqa_logits import (
-        _gluon_deepgemm_fp8_paged_mqa_logits,
-        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
-        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
-    )
-
-    enable_gluon_pa_mqa_logits = True
-    enable_jit_gluon_pa_mqa_logits_kernel = not enable_aot_gluon_pa_mqa_logits
-else:
-    from triton.compiler import ASTSource
-
-    from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
-        _deepgemm_fp8_paged_mqa_logits,
-        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
-        _deepgemm_fp8_paged_mqa_logits_ragged_k,
-        _deepgemm_fp8_paged_mqa_logits_stage1,
-        _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
-        _gluon_deepgemm_fp8_paged_mqa_logits,
-        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
-        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
-    )
-
-    enable_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits
-    enable_jit_gluon_pa_mqa_logits_kernel = False
+enable_aot_gluon_pa_mqa_logits = (
+    os.environ.get("AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS", "0") == "1"
+)
+enable_gluon_pa_mqa_logits = True
+enable_jit_gluon_pa_mqa_logits_kernel = not enable_aot_gluon_pa_mqa_logits
 
 
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
@@ -285,9 +243,6 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     else:
         fn_signature["SplitKV"] = "i32"
 
-    if triton_version < Version("3.4.0"):
-        assert not enable_jit_gluon_pa_mqa_logits_kernel
-        fn_signature["dummyPointerArg"] = "*i32"
     fn_signature["ChunkQ"] = "constexpr"
     fn_signature["ChunkK"] = "constexpr"
     fn_signature["KVBlockSize"] = "constexpr"
@@ -472,72 +427,35 @@ def deepgemm_fp8_paged_mqa_logits(
             WavePerEU=WavePerEU,
             VarCtxOpt=VarCtxOpt,
         )
-        if triton_version >= Version("3.5.0"):
-            cdna_version = get_cdna_version()
-            kernel[grid](
-                batch_size,
-                next_n,
-                heads,
-                q_fp8,
-                q_fp8.stride(0),
-                q_fp8.stride(1),
-                q_fp8.stride(2),
-                kv_cache_fp8,
-                kv_cache_fp8.stride(0),
-                kv_cache_scale,
-                kv_cache_scale.stride(0),
-                context_lens,
-                kv_indices,
-                weights,
-                weights.stride(0),
-                out_logits,
-                out_logits.stride(0),
-                max_model_len,
-                max_block_len,
-                SplitKV if not VarCtxOpt else VarCtxSchedule,
-                # constexpr
-                heads,
-                ChunkK,
-                KVBlockSize,
-                hidden_dim,
-                cdna_version,
-            )
-        else:  #  load AOT compiled gluon kernel
-            assert triton_version < Version(
-                "3.4.0"
-            ), "https://github.com/triton-lang/triton/pull/7258 involves a ABI-breaking change on triton3.4, "
-            "which adding an extra pointer argument at the end of kernel arguments. To ensure compatibility"
-            "with AOT compiled gluon kernel on triton3.5, a feasible solution is to add a pointer parameter "
-            "at the end of the parameters and ensure that the Triton version used is before the ABI "
-            "modification, i.e., verison<3.4.0"
-            kernel[grid](
-                batch_size,
-                next_n,
-                heads,
-                q_fp8,
-                q_fp8.stride(0),
-                q_fp8.stride(1),
-                q_fp8.stride(2),
-                kv_cache_fp8,
-                kv_cache_fp8.stride(0),
-                kv_cache_scale,
-                kv_cache_scale.stride(0),
-                context_lens,
-                kv_indices,
-                weights,
-                weights.stride(0),
-                out_logits,
-                out_logits.stride(0),
-                max_model_len,
-                max_block_len,
-                SplitKV if not VarCtxOpt else VarCtxSchedule,
-                out_logits,  # dummyPointerArg for triton version < 3.4.0,
-                # constexpr
-                heads,
-                ChunkK,
-                KVBlockSize,
-                hidden_dim,
-            )
+        cdna_version = get_cdna_version()
+        kernel[grid](
+            batch_size,
+            next_n,
+            heads,
+            q_fp8,
+            q_fp8.stride(0),
+            q_fp8.stride(1),
+            q_fp8.stride(2),
+            kv_cache_fp8,
+            kv_cache_fp8.stride(0),
+            kv_cache_scale,
+            kv_cache_scale.stride(0),
+            context_lens,
+            kv_indices,
+            weights,
+            weights.stride(0),
+            out_logits,
+            out_logits.stride(0),
+            max_model_len,
+            max_block_len,
+            SplitKV if not VarCtxOpt else VarCtxSchedule,
+            # constexpr
+            heads,
+            ChunkK,
+            KVBlockSize,
+            hidden_dim,
+            cdna_version,
+        )
     else:
         assert KVBlockSize == 1
         assert not Preshuffle, "Preshuffle mode is only supported on gluon kernel."

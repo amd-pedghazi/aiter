@@ -58,16 +58,6 @@ def check_environments():
             "Please consider using a Linux environment for compatibility.",
         )
 
-    triton_version = version.parse(triton.__version__)
-    required_triton_version = version.parse("3.2.0")
-
-    if triton_version < required_triton_version:
-        logger.warning(
-            f"Current Triton version {triton_version} is below the recommended 3.2.0 version. "
-            "Errors may occur and these issues will not be fixed. "
-            "Please consider upgrading Triton.",
-        )
-
     # Check Python version
     py_version = version.parse(f"{sys.version_info.major}.{sys.version_info.minor}")
     required_py_version = version.parse("3.11")
