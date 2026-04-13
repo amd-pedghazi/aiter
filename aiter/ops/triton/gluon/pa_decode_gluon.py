@@ -280,6 +280,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     IS_CAUSAL: gl.constexpr,
     CDNA_VERSION: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr = 0,
+    GLOBAL_WINDOW: gl.constexpr = 0,
 ):
     """
     Gluon-based paged attention decode kernel with FP8 support for large blocks.
@@ -544,7 +545,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     kv_head_idx = gl.program_id(1)
     output_partition_idx = gl.program_id(2)
     context_length = gl.load(context_lengths_ptr + sequence_idx)
-
     # Compute KV partition index (adjusted for sliding window)
     if SLIDING_WINDOW > 0:
         sequence_start_idx = context_length - SLIDING_WINDOW
@@ -743,13 +743,11 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
                 mask=kv_scale_mask,
                 other=0.0,
             )
-            key_scale_shared.store(key_scale_value)
             value_scale_value = gl.load(
                 value_scale + key_scale_offsets,
                 mask=kv_scale_mask,
                 other=0.0,
             )
-            value_scale_shared.store(value_scale_value)
 
         # Calculate column offsets for QK computation
         qk_column_offsets = kv_sub_sequence_start_index + gl.arange(
@@ -788,6 +786,9 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
         # Convert layouts for MFMA operation
         query_converted = query_shared.load(qk_lhs_layout)
+        if KV_QUANT_MODE == 1:
+            key_scale_shared.store(key_scale_value)
+            value_scale_shared.store(value_scale_value)
         key_converted = gl.convert_layout(key_block, layout=qk_rhs_layout)
         key_converted = key_converted.to(COMPUTE_TYPE)
         # ==================== Value Cache Loading ====================
@@ -830,7 +831,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         )
         for _ in gl.static_range(8):
             qk_matrix = _amd_iglp_sched_group_barrier(qk_matrix, VMEM_LOAD, 1, 1)
-            qk_matrix = _amd_iglp_sched_group_barrier(qk_matrix, COMPUTE, 4, 1)
+            qk_matrix = _amd_iglp_sched_group_barrier(qk_matrix, COMPUTE, 8, 1)
         qk_matrix = _amd_iglp_sched_barrier(qk_matrix, 0x0)
         # ==================== Scale QK Scores ====================
         if KV_QUANT_MODE >= 0:
@@ -856,24 +857,30 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             sequence_extension = (
                 QUERY_SEQ_LEN - 1 - qk_row_offsets // ONE_QUERY_GROUP_SIZE_POW2
             )
-            causal_mask = (
-                sequence_extension[:, None] + qk_column_offsets[None, :]
-                < context_length
-            )
+            causal_qk_offsets = sequence_extension[:, None] + qk_column_offsets[None, :]
+            context_mask = causal_qk_offsets < context_length
+            causal_mask = context_mask
             if SLIDING_WINDOW > 0:
-                causal_mask = causal_mask & (
-                    sequence_extension[:, None] + qk_column_offsets[None, :]
-                    >= sequence_start_idx + QUERY_SEQ_LEN
+                local_window_mask = (
+                    causal_qk_offsets >= sequence_start_idx + QUERY_SEQ_LEN
                 )
+                causal_mask = context_mask & local_window_mask
         else:
-            causal_mask = qk_column_offsets[None, :] < context_length
+            context_mask = qk_column_offsets[None, :] < context_length
+            causal_mask = context_mask
             if SLIDING_WINDOW > 0:
                 query_token_idx = qk_row_offsets // ONE_QUERY_GROUP_SIZE_POW2
-                causal_mask = causal_mask & (
+                local_window_mask = (
                     qk_column_offsets[None, :]
                     >= sequence_start_idx + query_token_idx[:, None] + 1
                 )
+                causal_mask = context_mask & local_window_mask
 
+        if GLOBAL_WINDOW > 0:
+            global_window_mask = context_mask & (
+                qk_column_offsets[None, :] < GLOBAL_WINDOW
+            )
+            causal_mask = causal_mask | global_window_mask
         # Combine masks
         combined_mask = qk_row_mask[:, None] & causal_mask
         qk_matrix = gl.convert_layout(qk_matrix, layout=qk_linear_layout)
@@ -4342,6 +4349,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     VALUE_TRANSPOSED,
     IS_CAUSAL,
     SLIDING_WINDOW,
+    GLOBAL_WINDOW,
     sinks_ptr,
     PS,
     CDNA_VERSION,
@@ -4444,14 +4452,67 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
 
     if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE:
         # Use big block kernel for large block sizes
-        paged_attention_kernel = paged_attention_decode_v2_gluon_large_block_dot_kernel
+        paged_attention_decode_v2_gluon_large_block_dot_kernel[grid](
+            exp_sums_ptr,
+            max_logits_ptr,
+            output_ptr,
+            query_ptr,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr,
+            context_lengths_ptr,
+            softmax_scale,
+            query_scale,
+            key_scale,
+            value_scale,
+            stride_max_logits_seq,
+            stride_max_logits_head,
+            stride_max_logits_part,
+            stride_output_seq,
+            stride_output_head,
+            stride_output_part,
+            stride_output_group,
+            stride_query_bs,
+            stride_query_qlen,
+            stride_query_kv_head,
+            stride_query_group_size,
+            stride_key_block,
+            stride_key_head,
+            stride_key_head_split,
+            stride_key_block_elem,
+            stride_value_block,
+            stride_value_head_size,
+            stride_value_block_elem,
+            stride_block_table_seq,
+            stride_query_scale_bs,
+            stride_query_scale_qlen,
+            stride_query_scale_kv_head,
+            kv_scale_stride_0,
+            kv_scale_stride_1,
+            head_size=HEAD_SIZE,
+            num_seqs=grid[0],
+            num_kv_heads=grid[1],
+            max_context_partition_num=grid[2],
+            COMPUTE_TYPE=COMPUTE_TYPE,
+            QUERY_SEQ_LEN=query_seq_len,
+            ONE_QUERY_GROUP_SIZE=query_group_size,
+            HEAD_SIZE_POW2=HEAD_SIZE_POW2,
+            KV_BLOCK_SIZE=KV_BLOCK_SIZE,
+            CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
+            KV_COMPUTE_BLOCK_SIZE=KV_COMPUTE_BLOCK_SIZE,
+            QUERY_QUANT_MODE=QUERY_QUANT_MODE,
+            KV_QUANT_MODE=KV_QUANT_MODE,
+            FP8_MAX_VALUE=FP8_MAX_VALUE,
+            VALUE_TRANSPOSED=VALUE_TRANSPOSED,
+            IS_CAUSAL=IS_CAUSAL,
+            CDNA_VERSION=CDNA_VERSION,
+            SLIDING_WINDOW=SLIDING_WINDOW,
+            GLOBAL_WINDOW=GLOBAL_WINDOW,
+        )
+        return
 
-    else:
-        # Use standard kernel for normal block sizes
-        paged_attention_kernel = paged_attention_decode_v2_gluon_dot_kernel
-
-    # Launch the dot kernel
-    paged_attention_kernel[grid](
+    # Use standard kernel for normal block sizes
+    paged_attention_decode_v2_gluon_dot_kernel[grid](
         exp_sums_ptr,
         max_logits_ptr,
         output_ptr,
@@ -4628,6 +4689,7 @@ def pa_decode_gluon(
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
     ps: bool = True,
+    global_window: int = 0,
 ) -> None:
     """
     Paged Attention Decode with FP8/BF16/FP16 Support.
@@ -4983,6 +5045,7 @@ def pa_decode_gluon(
         VALUE_TRANSPOSED=value_transposed,
         IS_CAUSAL=is_causal,
         SLIDING_WINDOW=sliding_window,
+        GLOBAL_WINDOW=global_window,
         sinks_ptr=sinks,
         PS=ps,
         CDNA_VERSION=cdna_version,
