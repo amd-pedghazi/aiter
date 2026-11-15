@@ -390,9 +390,15 @@ def xcd_remap_bx_by(
     grid_n = (N + tile_n - 1) // tile_n if N % tile_n else N // tile_n
     _gx = fx.Index(grid_n)
     _gy = (c_m + _c_tm - _c1) // _c_tm
+    return xcd_remap_grid(
+        bx, by, _gy, _gx, xcd_swizzle=xcd_swizzle, num_xcds=num_xcds
+    )
 
-    _linear_id = bx * _gx + by
-    _num_wgs = _gx * _gy
+
+def xcd_remap_grid(bx, by, grid_m, grid_n, *, xcd_swizzle: int, num_xcds: int = 8):
+    """Remap a grid as a permutation even when its size is not divisible by 8."""
+    _linear_id = bx * grid_n + by
+    _num_wgs = grid_n * grid_m
 
     _c_xcds = fx.Index(num_xcds)
     _q = _num_wgs // _c_xcds
@@ -403,6 +409,8 @@ def xcd_remap_bx_by(
     _wgid = _xcd * _q + _clip + _in_xcd
 
     _c_wgm = fx.Index(xcd_swizzle)
+    _gx = grid_n
+    _gy = grid_m
     _num_wgid_in_group = _c_wgm * _gx
     _group_id = _wgid // _num_wgid_in_group
     _first_pid_m = _group_id * _c_wgm
@@ -428,4 +436,5 @@ __all__ = [
     "swizzle_xor16",
     "tile_chunk_coord_i32",
     "xcd_remap_bx_by",
+    "xcd_remap_grid",
 ]

@@ -2376,6 +2376,7 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
+    stage2_skips_inter_pad: bool = False,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -2431,6 +2432,7 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        stage2_skips_inter_pad=stage2_skips_inter_pad,
     )
 
 
@@ -3062,6 +3064,20 @@ def _opus_stage2_fp8_enabled():
     return os.environ.get("AITER_OPUS_STAGE2_FP8", "1") == "1"
 
 
+_STAGE2_FP8_REDUCE_STREAMING = (
+    os.environ.get("AITER_FLYDSL_STAGE2_FP8_REDUCE_STREAMING", "0") == "1"
+)
+_STAGE2_FP8_REDUCE_STREAMING_MIN_MIB = int(
+    os.environ.get("AITER_FLYDSL_STAGE2_FP8_REDUCE_STREAMING_MIN_MIB", "192")
+)
+
+
+def _use_streaming_reduce_loads(route_out_nbytes: int, is_fp8_route: bool) -> bool:
+    if not _STAGE2_FP8_REDUCE_STREAMING or not is_fp8_route:
+        return False
+    return route_out_nbytes > _STAGE2_FP8_REDUCE_STREAMING_MIN_MIB * 2**20
+
+
 def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
@@ -3085,6 +3101,7 @@ def _flydsl_v2_stage2_wrapper(
     topk_weights=None,
     reverse_sorted=None,
     use_valid_token_count=False,
+    inter_dim_pad=0,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -3217,6 +3234,7 @@ def _flydsl_v2_stage2_wrapper(
         is_ep=expert_mask is not None,
         out_scale=target_scale,
         use_valid_token_count=use_valid_token_count,
+        D_INTER_VALID=inter_dim - inter_dim_pad // 32 * 32,
     )
     if _s2_fp4_scatter:
         aiter.mxfp4_moe_scatter_reduce_q(
@@ -3258,6 +3276,9 @@ def _flydsl_v2_stage2_wrapper(
             topk_weights=topk_weights if _defer_w else None,
             fp8_scale_blk=_fp8_scale_blk,
             fp8_pitch_align=_fp8_pitch_align,
+            streaming_loads=_use_streaming_reduce_loads(
+                target.nbytes, _s2_fp8_inter
+            ),
         )
     return out
 
@@ -4012,6 +4033,7 @@ def get_2stage_cfgs(
                 activation=activation,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
+                stage2_skips_inter_pad=is_flydsl2_layout,
             )
         else:
             stage1_func = functools.partial(
@@ -4035,6 +4057,7 @@ def get_2stage_cfgs(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
                 num_experts=expert,
+                inter_dim_pad=intermediate_pad,
             )
         elif is_flydsl2:
             stage2_func = functools.partial(
