@@ -55,6 +55,7 @@ from .mfma_preshuffle_pipeline import (
     make_preshuffle_scale_layout,
     swizzle_xor16,
     tile_chunk_coord_i32,
+    xcd_remap_grid,
 )
 from .tensor_shim import ptr_rsrc
 
@@ -142,6 +143,7 @@ def compile_mixed_moe_gemm1_common(
     shared_expert_id: int | None = None,
     clamp_shared: bool = True,
     v2_output_layout: bool = False,
+    stage2_skips_inter_pad: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
     heterogeneous_b = shared_expert_id is not None
@@ -538,6 +540,13 @@ def compile_mixed_moe_gemm1_common(
             by = gpu.block_id("x")
             bx_persist = gpu.block_id("y")
 
+            numids_rsrc = ptr_rsrc(
+                arg_num_valid_ids, arith.constant(4, type=T.i32)
+            )
+            num_valid_i32 = buffer_ops.buffer_load(
+                numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
+            )
+
             if const_expr(xcd_swizzle > 0):
                 num_xcds = 8
                 one = arith.constant(1, index=True)
@@ -554,26 +563,36 @@ def compile_mixed_moe_gemm1_common(
                     )
                 persist_m_idx = arith.constant(persist_m, index=True)
                 grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
-                linear_id = bx_persist * grid_x + by
-                num_workgroups = grid_x * grid_y
-                num_xcds_idx = arith.constant(num_xcds, index=True)
-                workgroups_per_xcd = num_workgroups // num_xcds_idx
-                workgroup_id = (linear_id % num_xcds_idx) * workgroups_per_xcd + (
-                    linear_id // num_xcds_idx
+                rows_per_y = sort_block_m * persist_m
+                rows_per_y_idx = arith.constant(rows_per_y, index=True)
+                valid_y = (
+                    fx.Index(num_valid_i32) + rows_per_y_idx - one
+                ) // rows_per_y_idx
+                valid_y = arith.select(
+                    arith.cmpi(CmpIPredicate.ult, valid_y, grid_y),
+                    valid_y,
+                    grid_y,
                 )
-                group_m = arith.constant(xcd_swizzle, index=True)
-                workgroups_per_group = group_m * grid_x
-                group_id = workgroup_id // workgroups_per_group
-                first_m = group_id * group_m
-                remaining_m = grid_y - first_m
-                group_size_m = arith.select(
-                    arith.cmpi(CmpIPredicate.ult, remaining_m, group_m),
-                    remaining_m,
-                    group_m,
+                valid_y = arith.select(
+                    arith.cmpi(
+                        CmpIPredicate.ugt,
+                        valid_y,
+                        arith.constant(0, index=True),
+                    ),
+                    valid_y,
+                    one,
                 )
-                workgroup_in_group = workgroup_id % workgroups_per_group
-                bx_persist = first_m + (workgroup_in_group % group_size_m)
-                by = workgroup_in_group // group_size_m
+                remap_m, remap_n = xcd_remap_grid(
+                    bx_persist,
+                    by,
+                    grid_m=valid_y,
+                    grid_n=grid_x,
+                    xcd_swizzle=xcd_swizzle,
+                    num_xcds=num_xcds,
+                )
+                wg_live = bx_persist < valid_y
+                bx_persist = wg_live.select(remap_m, bx_persist)
+                by = wg_live.select(remap_n, by)
 
             by_n = by * arith.constant(tile_n, index=True)
             if const_expr(pad_skip_s1):
@@ -634,11 +653,6 @@ def compile_mixed_moe_gemm1_common(
             x_rsrc = ptr_rsrc(arg_x, x_nbytes_i32)
 
             shared_w_rsrc = ptr_rsrc(arg_shared_w, shared_w_nbytes)
-
-            numids_rsrc = ptr_rsrc(arg_num_valid_ids, arith.constant(4, type=T.i32))
-            num_valid_i32 = buffer_ops.buffer_load(
-                numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
-            )
 
             sx_rsrc = 1
             sw_rsrc = 1
@@ -3011,7 +3025,11 @@ def compile_mixed_moe_gemm1_common(
 
         inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True)
         tile2_pad = 0
-        if const_expr(not gate_only):
+        if const_expr(stage2_skips_inter_pad and not gate_only):
+            tile2_pad = min(
+                inter_dim_pad, (32 - (inter_dim - inter_dim_pad) % 32) % 32
+            )
+        elif const_expr(not gate_only):
             tile_k_stage2 = tile_k // 2
             tile2_pad = (
                 tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
