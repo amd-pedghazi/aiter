@@ -104,6 +104,36 @@ def _barrier(vmcnt=63, lgkmcnt=63):
 # HEAD generic path uses `barrier`; a16w4 uses `_barrier`.
 barrier = _barrier
 
+# dev-B fused stage 1 -> stage 2 launch (attlas_1120/dev_b/fused/fused_s12.py). Trace-time hooks, all empty unless that
+# builder traces one of the bodies below into its own kernel:
+#   "bid":       {"x": index, "y": index} used instead of gpu.block_id (the fused kernel maps its 1-D id itself);
+#   "wt":        stage-1 FP8 rows and sorted e8m0 scales are stored write-through at device scope (sc1), so another
+#                XCD reads them from memory after the ready counter says so;
+#   "s1_done":   fn(sort_block, pred) after a stage-1 tile (pred: the tile ran its body);
+#   "s2_wait":   fn(sort_block, pred) before a stage-2 tile's body; "s2_done": fn(sort_block, pred) after it;
+#   "alloc":     the fused kernel's SharedAllocator (FlyDSL allows one per kernel).
+_DEVB = {}
+_DEVB_BUILT = {}  # id(launcher) -> the body and grid of a compiled stage-1 / stage-2 builder
+
+
+def _block_id(axis):
+    bid = _DEVB.get("bid")
+    return gpu.block_id(axis) if bid is None else bid[axis]
+
+
+def _shared_allocator():
+    # one SharedAllocator per kernel: the fused kernel hands both bodies its own (their LDS adds up)
+    alloc = _DEVB.get("alloc")
+    return fx.SharedAllocator() if alloc is None else alloc
+
+
+def _s1_fp8_store(raw, ptr, alignment):
+    # agent-scope atomic store = global_store with sc1 on gfx950: written through to memory
+    if _DEVB.get("wt"):
+        llvm.StoreOp(raw, ptr, alignment=alignment, ordering=llvm.AtomicOrdering.monotonic, syncscope="agent")
+    else:
+        llvm.StoreOp(raw, ptr, alignment=alignment, nontemporal=True)
+
 
 def _idx_to_llvm_ptr(idx_val, addr_space=1):
     """Convert a byte address to an LLVM pointer without adding alignment claims."""
@@ -144,8 +174,21 @@ def compile_mixed_moe_gemm1_common(
     clamp_shared: bool = True,
     v2_output_layout: bool = False,
     stage2_skips_inter_pad: bool = False,
+    fp8_exact: bool | None = None,
 ):
-    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
+    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim].
+
+    fp8_exact (dev-B; None = env AITER_DEVB_S1FP8_EXACT): the FP8 epilogue quantizes like the bf16 output path
+    followed by fused_dynamic_mxfp8_quant_moe_sort (values rounded to bf16, amax floored at 1e-10, e8m0 =
+    ceil_pow2(amax / 448)), so its MXFP8 codes and scales equal today's two-kernel path bit for bit.
+    """
+    if fp8_exact is None:  # the rows dev-B replaces (257-2048 rows) have xcd_swizzle 0; prefill rows keep AITER's rule
+        # AITER_DEVB_S1FP8_EXACT_KEYS (11-23): extra "<tile_m>/<waves_per_eu>/<xcd_swizzle>" stage-1 builds that get the
+        # exact rule too (comma list), for decode rows with an xcd swizzle; the prefill rows (t64 w4 xcd1) stay out.
+        fp8_exact = os.environ.get("AITER_DEVB_S1FP8_EXACT", "0") == "1" and (
+            xcd_swizzle == 0 or f"{tile_m}/{waves_per_eu}/{xcd_swizzle}"
+            in [k.strip() for k in os.environ.get("AITER_DEVB_S1FP8_EXACT_KEYS", "").split(",")])
+    _devb_kwargs = dict(locals())
     heterogeneous_b = shared_expert_id is not None
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
@@ -259,9 +302,10 @@ def compile_mixed_moe_gemm1_common(
     need_fp8 = out_dtype == "fp8"
     need_quant = need_fp4 or need_fp8
     need_sort = need_quant
+    fp8_exact = bool(fp8_exact) and need_fp8 and not is_splitk
 
     fp4q_tag = "_fp4q" if need_fp4 else ""
-    fp8q_tag = "_fp8q" if need_fp8 else ""
+    fp8q_tag = ("_fp8qx" if fp8_exact else "_fp8q") if need_fp8 else ""
     sort_tag = "_sort" if need_sort else ""
     async_tag = "_async" if use_async_copy else ""
     sk_tag = f"_sk{k_batch}" if is_splitk else ""
@@ -537,8 +581,8 @@ def compile_mixed_moe_gemm1_common(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
-            by = gpu.block_id("x")
-            bx_persist = gpu.block_id("y")
+            by = _block_id("x")
+            bx_persist = _block_id("y")
 
             numids_rsrc = ptr_rsrc(
                 arg_num_valid_ids, arith.constant(4, type=T.i32)
@@ -626,7 +670,7 @@ def compile_mixed_moe_gemm1_common(
                 pong: fx.Array[fx.Uint8, pong_field_bytes, 16]
                 ping: fx.Array[fx.Uint8, ping_field_bytes, 16]
 
-            _lds = fx.SharedAllocator().allocate(_MoeGemm1Smem).peek()
+            _lds = _shared_allocator().allocate(_MoeGemm1Smem).peek()
             lds_x_pong = _lds.pong.ptr
             lds_x_ping = _lds.ping.ptr
             base_ptr_pong = lds_x_pong
@@ -2366,9 +2410,14 @@ def compile_mixed_moe_gemm1_common(
                     if const_expr(need_quant and not is_splitk):
                         frag_vals = []
                         for i in range_constexpr(e_vec):
-                            frag_vals.append(fx.Vector(frag)[i])
+                            v_i = fx.Vector(frag)[i]
+                            if const_expr(fp8_exact):
+                                v_i = v_i.to(fx.BFloat16).to(fx.Float32)
+                            frag_vals.append(v_i)
 
-                        local_max = c0_f32
+                        local_max = (
+                            arith.constant(1e-10, type=T.f32) if fp8_exact else c0_f32
+                        )
                         for i in range_constexpr(e_vec):
                             abs_v = llvm.call_intrinsic(
                                 f32, "llvm.fabs.f32", [frag_vals[i].ir_value()], [], []
@@ -2380,10 +2429,30 @@ def compile_mixed_moe_gemm1_common(
                             peer = local_max.shuffle_xor(off, c64_i32)
                             local_max = arith.maximumf(local_max, peer)
 
-                        max_i32 = local_max.bitcast(T.i32)
-                        max_rounded = (max_i32 + c0x400000_i32) & c0xFF800000_i32
-                        exp_field = max_rounded >> c23_i32
-                        e8m0_biased = arith.maxsi(exp_field - c_headroom_i32, c0_i32)
+                        if const_expr(fp8_exact):
+                            # ceil_pow2(amax / 448), as aiter fp_f32_to_e8m0_scale<RoundUp, FP8_E4M3>
+                            u_i32 = arith.mulf(
+                                local_max, arith.constant(1.0 / 448.0, type=T.f32)
+                            ).bitcast(T.i32)
+                            exp_u = (u_i32 >> c23_i32) & arith.constant(255, type=T.i32)
+                            bump = arith.andi(
+                                arith.cmpi(
+                                    CmpIPredicate.ne,
+                                    u_i32 & arith.constant(0x7FFFFF, type=T.i32),
+                                    c0_i32,
+                                ),
+                                arith.cmpi(
+                                    CmpIPredicate.ult,
+                                    exp_u,
+                                    arith.constant(255, type=T.i32),
+                                ),
+                            )
+                            e8m0_biased = arith.select(bump, exp_u + c1_i32, exp_u)
+                        else:
+                            max_i32 = local_max.bitcast(T.i32)
+                            max_rounded = (max_i32 + c0x400000_i32) & c0xFF800000_i32
+                            exp_field = max_rounded >> c23_i32
+                            e8m0_biased = arith.maxsi(exp_field - c_headroom_i32, c0_i32)
 
                         quant_exp = c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << c23_i32).bitcast(T.f32)
@@ -2472,24 +2541,14 @@ def compile_mixed_moe_gemm1_common(
                                         if hasattr(store_val, "_value")
                                         else store_val
                                     )
-                                    llvm.StoreOp(
-                                        store_raw,
-                                        out_ptr_v,
-                                        alignment=2,
-                                        nontemporal=True,
-                                    )
+                                    _s1_fp8_store(store_raw, out_ptr_v, 2)
                                 else:
                                     packed_raw = (
                                         packed_i32._value
                                         if hasattr(packed_i32, "_value")
                                         else packed_i32
                                     )
-                                    llvm.StoreOp(
-                                        packed_raw,
-                                        out_ptr_v,
-                                        alignment=4,
-                                        nontemporal=True,
-                                    )
+                                    _s1_fp8_store(packed_raw, out_ptr_v, 4)
                             else:
                                 for wg in range_constexpr(e_vec // 4):
                                     b = wg * 4
@@ -2517,12 +2576,7 @@ def compile_mixed_moe_gemm1_common(
                                         if hasattr(packed_w, "_value")
                                         else packed_w
                                     )
-                                    llvm.StoreOp(
-                                        packed_raw,
-                                        out_ptr_v,
-                                        alignment=4,
-                                        nontemporal=True,
-                                    )
+                                    _s1_fp8_store(packed_raw, out_ptr_v, 4)
 
                         if const_expr(need_sort):
                             col_g0_i32 = fx.Int32(col_g0)
@@ -2551,6 +2605,7 @@ def compile_mixed_moe_gemm1_common(
                                     sorted_scale_rsrc,
                                     byte_off,
                                     offset_is_bytes=True,
+                                    cache_modifier=16 if _DEVB.get("wt") else 0,
                                 )
 
                             @flyc.jit
@@ -2851,6 +2906,8 @@ def compile_mixed_moe_gemm1_common(
                     )
                 _gemm1_dispatch()
                 gpu.barrier()
+                if const_expr("s1_done" in _DEVB):
+                    _DEVB["s1_done"](bx, blk_valid, exp_valid)
 
             c0_p = arith.constant(0, index=True)
             c1_p = arith.constant(1, index=True)
@@ -3022,36 +3079,7 @@ def compile_mixed_moe_gemm1_common(
         # LDS bytes are tracked automatically by the fly SharedAllocator; no
         # manual finalize is needed.
         ctx = CompilationContext.get_current()
-
-        inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True)
-        tile2_pad = 0
-        if const_expr(stage2_skips_inter_pad and not gate_only):
-            tile2_pad = min(
-                inter_dim_pad, (32 - (inter_dim - inter_dim_pad) % 32) % 32
-            )
-        elif const_expr(not gate_only):
-            tile_k_stage2 = tile_k // 2
-            tile2_pad = (
-                tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
-            ) % tile_k_stage2
-
-        inter_in = fx.Index(i32_inter_in)
-        tile_n_index = arith.constant(tile_n, index=True)
-        if const_expr(mock_gate_only or gate_up_interleave):
-            gx = (
-                inter_in - inter_dim_pad_total + tile2_pad + tile_n_index - 1
-            ) // tile_n_index
-        else:
-            gx = (
-                (inter_in - inter_dim_pad_total + tile2_pad + 2 * tile_n_index - 1)
-                // tile_n_index
-                // arith.constant(2, index=True)
-            )
-
-        c_pm_l = arith.constant(persist_m, index=True)
-        gy = (
-            fx.Index(i32_size_expert_ids_in) + c_pm_l - arith.constant(1, index=True)
-        ) // c_pm_l
+        gx, gy = _grid1(i32_inter_in, i32_size_expert_ids_in)
 
         if const_expr(heterogeneous_b):
             launcher = moe_gemm1(
@@ -3109,6 +3137,38 @@ def compile_mixed_moe_gemm1_common(
         launcher.launch(
             grid=(gx, gy, k_batch), block=(total_threads, 1, 1), stream=stream
         )
+
+    def _grid1(i32_inter_in, i32_size_expert_ids_in):
+        inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True)
+        tile2_pad = 0
+        if const_expr(stage2_skips_inter_pad and not gate_only):
+            tile2_pad = min(
+                inter_dim_pad, (32 - (inter_dim - inter_dim_pad) % 32) % 32
+            )
+        elif const_expr(not gate_only):
+            tile_k_stage2 = tile_k // 2
+            tile2_pad = (
+                tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
+            ) % tile_k_stage2
+
+        inter_in = fx.Index(i32_inter_in)
+        tile_n_index = arith.constant(tile_n, index=True)
+        if const_expr(mock_gate_only or gate_up_interleave):
+            gx = (
+                inter_in - inter_dim_pad_total + tile2_pad + tile_n_index - 1
+            ) // tile_n_index
+        else:
+            gx = (
+                (inter_in - inter_dim_pad_total + tile2_pad + 2 * tile_n_index - 1)
+                // tile_n_index
+                // arith.constant(2, index=True)
+            )
+
+        c_pm_l = arith.constant(persist_m, index=True)
+        gy = (
+            fx.Index(i32_size_expert_ids_in) + c_pm_l - arith.constant(1, index=True)
+        ) // c_pm_l
+        return gx, gy
 
     if heterogeneous_b:
 
@@ -3216,6 +3276,12 @@ def compile_mixed_moe_gemm1_common(
                 stream,
             )
 
+    _DEVB_BUILT[id(launch_mixed_moe_gemm1)] = dict(
+        emit=_emit_moe_gemm1, grid=_grid1, module_name=module_name, total_threads=total_threads,
+        heterogeneous_b=heterogeneous_b, persist_m=persist_m, k_batch=k_batch, sort_block_m=sort_block_m,
+        need_fp8=need_fp8, v2_output_layout=v2_output_layout, kwargs=_devb_kwargs,
+        lds_bytes=pong_field_bytes + ping_field_bytes,
+    )
     return launch_mixed_moe_gemm1
 
 
@@ -3534,8 +3600,8 @@ def compile_mixed_moe_gemm2_common(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
-            by_outer = gpu.block_id("x")
-            bx_persist = gpu.block_id("y")
+            by_outer = _block_id("x")
+            bx_persist = _block_id("y")
 
             if const_expr(xcd_swizzle > 0):
                 num_xcds = 8
@@ -3589,7 +3655,7 @@ def compile_mixed_moe_gemm2_common(
             class _MoeGemm2Smem:
                 slab: fx.Array[fx.Uint8, lds_alloc_bytes, 16]
 
-            _lds = fx.SharedAllocator().allocate(_MoeGemm2Smem).peek()
+            _lds = _shared_allocator().allocate(_MoeGemm2Smem).peek()
             lds_x = _lds.slab.ptr
             lds_out = (
                 fx.recast_iter(lds_out_fly_dtype, lds_x)
@@ -5205,6 +5271,9 @@ def compile_mixed_moe_gemm2_common(
                         blk_valid, arith.andi(exp_valid, tile_has_tokens)
                     )
 
+                if const_expr("s2_wait" in _DEVB):
+                    _DEVB["s2_wait"](sort_blk, blk_valid, exp_valid)
+
                 @flyc.jit
                 def _gemm2_valid_dispatch():
                     if fx.Boolean(guard):
@@ -5212,6 +5281,8 @@ def compile_mixed_moe_gemm2_common(
 
                 _gemm2_valid_dispatch()
                 gpu.barrier()
+                if const_expr("s2_done" in _DEVB):
+                    _DEVB["s2_done"](sort_blk, blk_valid, exp_valid)
                 return [cur_active] if persistent else [expert_i32, expert_b_base]
 
             @flyc.jit
@@ -5504,4 +5575,18 @@ def compile_mixed_moe_gemm2_common(
                 stream,
             )
 
+    _DEVB_BUILT[id(launch_mixed_moe_gemm2)] = dict(
+        emit=_emit_moe_gemm2, module_name=module_name, tile_m=tile_m, tile_n=tile_n, model_dim_pad=model_dim_pad,
+        heterogeneous_b=heterogeneous_b, persistent=persistent, persist_m=persist_m, sort_block_m=_sort_block_m,
+        accumulate=accumulate, lds_bytes=lds_alloc_bytes,
+    )
     return launch_mixed_moe_gemm2
+
+
+# dev-B serving switch: with AITER_DEVB_FUSED_S12=1 and dev_b/fused/fused_s12.py mounted as
+# aiter/ops/flydsl/kernels/devb_fused_s12.py, every fusable stage-1 + stage-2 pair of a fused_moe call runs as one launch.
+if os.environ.get("AITER_DEVB_FUSED_S12", "0") == "1":
+    from aiter.ops.flydsl.kernels import devb_fused_s12 as _devb_fused_s12
+
+    if hasattr(_devb_fused_s12, "install"):  # else it is being imported first and installs itself at its end
+        _devb_fused_s12.install()
