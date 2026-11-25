@@ -237,7 +237,7 @@ def get_flydsl_stage1_kernels(
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
     b_nts = [0, 2]
-    xcd_swizzles = [0, 1, 4] if is_a16w4 else [0, 4]
+    xcd_swizzles = [0, 1, 4]
 
     for tm in tile_ms:
         # tile_m=16 shares tile_m=32's N-tile set: m_repeat<=2 either way.
@@ -673,6 +673,7 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    stage2_skips_inter_pad: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -734,6 +735,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+            stage2_skips_inter_pad=stage2_skips_inter_pad,
         )
     else:
         raise ValueError(
@@ -1057,6 +1059,7 @@ def _run_moe_reduction(
     topk_weights=None,
     fp8_scale_blk=None,
     fp8_pitch_align=None,
+    streaming_loads=False,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1132,6 +1135,7 @@ def _run_moe_reduction(
         use_weight=use_weight,
         scale_blk=fp8_scale_blk if is_fp8 else None,
         pitch_align=fp8_pitch_align if is_fp8 else None,
+        streaming_loads=streaming_loads,
     )
     _run_compiled(
         reduce_exe,
@@ -1486,6 +1490,7 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    stage2_skips_inter_pad: bool = False,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1769,6 +1774,8 @@ def _flydsl_moe_stage1_impl(
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
+        if stage2_skips_inter_pad and inter_dim_pad > 0:
+            compile_kwargs["stage2_skips_inter_pad"] = True
     exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
 
@@ -1950,6 +1957,7 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    stage2_skips_inter_pad: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1966,6 +1974,8 @@ def flydsl_moe_stage1(
     add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
 
     gate_mode controls the gate/up computation strategy (see GateMode enum).
+
+    stage2_skips_inter_pad lets a v2 stage 2 omit zero-padded K columns.
 
     Returns:
         Basic:                      out
@@ -2007,6 +2017,7 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        stage2_skips_inter_pad=stage2_skips_inter_pad,
     )
 
 
